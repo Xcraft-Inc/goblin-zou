@@ -2,7 +2,7 @@
 
 ## Aperçu
 
-`goblin-zou` fournit des utilitaires pour récupérer des informations relatives au flux de travail « Zou ». Le module expose un acteur **Goblin** singleton (`zou`) dont les quêtes interrogent un dépôt distant, soit via des commandes `git` spécialisées (mode « bash »), soit via l'outil en ligne de commande `zou` (mode « net »). Il permet notamment d'obtenir le SHA d'un dépôt (`shar`), la dernière version (`vlast`) et la table des versions des modules (`vtable`).
+`goblin-zou` fournit des utilitaires pour récupérer des informations relatives au flux de travail « Zou ». Le module expose un acteur **Goblin** singleton (`zou`) dont les quêtes interrogent un dépôt distant à l'aide de l'outil en ligne de commande `zou`. Il permet notamment de synchroniser un dépôt dans un cache local (`sync`), d'obtenir son SHA (`shar`), sa dernière version (`vlast`), la table des versions des modules (`vtable`) ainsi que la liste des modules publiables (`ipub`).
 
 ## Sommaire
 
@@ -22,27 +22,26 @@ Le module est composé des éléments suivants :
 - **`zou.js`** : point d'entrée Xcraft qui exporte `xcraftCommands` et charge `lib/service.js`.
 - **`lib/service.js`** : acteur Goblin singleton `zou` qui enregistre les quêtes.
 - **`lib/index.js`** : utilitaire `ZouUtils` qui gère le répertoire de cache local.
-- **`lib/zou.js`** : classe de base `Zou` (lancement de processus, parsing de la table des versions).
-- **`lib/zou-bash.js`** : implémentation `ZouBash` s'appuyant sur des commandes `git` spécialisées.
+- **`lib/zou.js`** : classe de base `Zou` (lancement de processus, parsing de la table des versions et de la liste `ipub`).
 - **`lib/zou-net.js`** : implémentation `ZouNet` s'appuyant sur l'outil `zou`.
 
 ## Fonctionnement global
 
 Le module est chargé dynamiquement par [xcraft-core-server] au démarrage grâce à `exports.xcraftCommands` dans `zou.js`. Les quêtes sont alors exposées sur le bus par [xcraft-core-bus].
 
-Chaque quête instancie une classe de traitement (`ZouBash` ou `ZouNet`) qui hérite de `Zou`. Cette dernière :
+Chaque quête instancie une classe `ZouNet` qui hérite de `Zou`. Cette dernière :
 
 1. crée un gestionnaire de processus avec [xcraft-core-process] (parser `git`, réponses routées vers `quest.resp`) ;
 2. garantit l'existence du répertoire de cache (`<tempRoot>/zou`) ;
 3. fournit `cmdProc()` pour lancer un exécutable avec `NO_COLOR=1` ;
-4. fournit `parseVtable()` pour convertir la sortie de `vtable` en objet.
+4. fournit `parseVtable()` et `parseIpub()` pour convertir la sortie des commandes `vtable` et `ipub` en objets.
 
-Les quêtes suffixées par `_bash` utilisent `git` ; les autres utilisent `zou`.
+`ZouNet` ajoute le nettoyage de la sortie (suppression des séquences ANSI, des espaces et des sauts de ligne en début/fin) et les méthodes correspondant à chaque quête.
 
 ```text
-Appelant ──► quête zou.xxx ──► ZouNet / ZouBash
+Appelant ──► quête zou.xxx ──► ZouNet
                                   │
-                                  ├─► processus (zou | git) dans <tempRoot>/zou/<nom-du-dépôt>
+                                  ├─► processus `zou` dans <tempRoot>/zou/<nom-du-dépôt>
                                   │
                                   └─► sortie nettoyée / parsée ──► résultat de la quête
 ```
@@ -67,9 +66,16 @@ const last = yield quest.cmd('zou.vlast', {url, sku});
 ### Lire la table des versions
 
 ```javascript
-// La table doit être disponible dans le cache (après un `sync`)
+// Le dépôt doit être présent dans le cache (après un `sync`)
 const vtable = yield quest.cmd('zou.vtable', {url, tag: 'v1.2.3'});
 // vtable['crm-core'] => {Module, Version, Hash, Dev, Prod}
+```
+
+### Lister les modules publiables
+
+```javascript
+const ipub = yield quest.cmd('zou.ipub', {url});
+// ipub est un objet indexé par nom de module
 ```
 
 ### Depuis un acteur Elf
@@ -81,11 +87,11 @@ const vtable = await this.quest.cmd('zou.vtable', {url, tag: 'v1.2.3'});
 ## Interactions avec d'autres modules
 
 - [xcraft-core-goblin] : enregistrement des quêtes et configuration de l'acteur singleton.
-- [xcraft-core-process] : exécution des commandes `git` et `zou`.
+- [xcraft-core-process] : exécution de la commande `zou`.
 - [xcraft-core-etc] : lecture de la configuration `xcraft` pour obtenir `tempRoot`.
 - [xcraft-core-server] / [xcraft-core-bus] : chargement des commandes exposées par `zou.js`.
 
-Le module requiert la présence sur la machine de l'exécutable `zou` (mode net) et/ou de `git` avec les sous-commandes spécialisées `cleanex`, `shar`, `vlast` et `vtable` (mode bash).
+Le module requiert la présence sur la machine de l'exécutable `zou`.
 
 ## Configuration avancée
 
@@ -93,9 +99,9 @@ Ce module ne possède pas de fichier `config.js`.
 
 ### Variables d'environnement
 
-| Variable   | Description                                                            | Exemple | Valeur par défaut |
-| ---------- | ---------------------------------------------------------------------- | ------- | ----------------- |
-| `NO_COLOR` | Définie à `1` dans l'environnement des processus `git` et `zou` lancés | `1`     | `1` (forcée)      |
+| Variable   | Description                                                   | Exemple | Valeur par défaut |
+| ---------- | ------------------------------------------------------------- | ------- | ----------------- |
+| `NO_COLOR` | Définie à `1` dans l'environnement des processus `zou` lancés | `1`     | `1` (forcée)      |
 
 Les autres variables d'environnement du processus courant sont transmises telles quelles aux processus enfants.
 
@@ -111,19 +117,11 @@ Acteur **Goblin** singleton nommé `zou` (nom déduit du fichier `zou.js`). Il n
 
 #### Méthodes publiques
 
-Quêtes basées sur `git` :
-
-- **`cleanex_bash(url)`** — Nettoie le dépôt en cache (`git cleanex -a -r -f`). Ne fait rien si le cache n'existe pas.
-- **`shar_bash(url, sku, mode)`** — Retourne le SHA calculé par `git shar` pour le dépôt et le `sku` donnés. `mode` est optionnel et transmis sous la forme `--<mode>`.
-- **`vlast_bash(url, sku)`** — Si le cache existe, effectue d'abord un `git pull`, puis retourne la dernière version via `git vlast`.
-- **`vtable_bash(url, tag)`** — Retourne la table des versions associée au `tag` sous forme d'objet indexé par nom de module.
-
-Quêtes basées sur `zou` :
-
 - **`sync(url, sku)`** — Clone ou synchronise le dépôt dans le cache (`zou clone`) et retourne la sortie nettoyée.
-- **`shar(url, sku, mode)`** — Retourne le SHA du dépôt (`--show-shar`).
+- **`shar(url, sku, mode)`** — Retourne le SHA du dépôt (`--show-shar`). `mode` est optionnel et transmis sous la forme `--<mode>`.
 - **`vlast(url, sku)`** — Retourne la dernière version (`--show-vlast`).
-- **`vtable(url, tag)`** — Retourne la table des versions au format JSON parsée, indexée par module.
+- **`vtable(url, tag)`** — Retourne la table des versions du `tag` donné, parsée et indexée par module.
+- **`ipub(url)`** — Retourne la liste des modules publiables (`zou ipub`), parsée depuis le JSON produit par l'outil.
 
 ### `lib/index.js`
 
@@ -135,21 +133,18 @@ Expose un singleton `ZouUtils`. Il lit la configuration `xcraft` via [xcraft-cor
 
 Classe de base `Zou`.
 
-- **`Zou.cmdProc(cmd, xProcess)`** — Retourne une fonction (gigawatts) qui lance `cmd` avec les arguments, le répertoire de travail (`cwd`) et le callback `stdout` fournis, avec `NO_COLOR=1`.
+- **`Zou.cmdProc(cmd, xProcess)`** — Retourne une fonction (gigawatts) qui lance `cmd` avec les arguments, le répertoire de travail (`cwd`) et les callbacks `stdout`/`stderr` fournis, avec `NO_COLOR=1`.
 - **`getCache(url)`** — Délègue à `ZouUtils`.
 - **`parseVtable(vtable)`** — Détecte le format de la sortie : tableau Markdown (commence par `|`) ou JSON (commence par `[`). Retourne un objet `{[module]: {Module, Version, Hash, Dev, Prod}}`. Lève l'erreur `unsupported vtable format` pour tout autre format.
-
-### `lib/zou-bash.js`
-
-Classe `ZouBash` (hérite de `Zou`). Elle utilise `git` avec les options `-v`, `--wrk=<cache>`, `--url=<url>` et `--sku=<sku>`.
-
-- **`cleanex(url)`**, **`pull(cache)`**, **`shar(url, sku, mode)`**, **`vlast(url, sku)`**, **`vtable(url, tag)`** — Pendants des quêtes `_bash`. `shar` ajoute l'option `-a=256`. `vtable` s'exécute dans le cache, qui doit donc déjà exister.
+- **`parseIpub(ipub)`** — Convertit la sortie JSON de `zou ipub` en objet indexé par nom de module. Le résultat est produit par un `reduce` sans valeur initiale : le premier élément du tableau sert d'accumulateur, il est donc lui-même utilisé comme objet résultat.
 
 ### `lib/zou-net.js`
 
 Classe `ZouNet` (hérite de `Zou`). Elle utilise l'exécutable `zou` et nettoie la sortie (suppression des séquences ANSI via `ansi-regex`, des espaces et des sauts de ligne en début/fin).
 
-- **`sync(url, sku)`**, **`shar(url, sku, mode)`**, **`vlast(url, sku)`**, **`vtable(url, tag)`** — Pendants des quêtes du même nom. `vtable` exécute `zou vtable show -t:json -0 <tag>` dans le cache, qui doit donc avoir été préparé par `sync`.
+- **`sync(url, sku)`**, **`shar(url, sku, mode)`**, **`vlast(url, sku)`** — Exécutent `zou clone <cache> --url=<url> --sku=<sku>` avec respectivement `-0`, `--show-shar -0` et `--show-vlast -0`. Pour `shar`, `mode` est ajouté sous la forme `--<mode>`.
+- **`vtable(url, tag)`** — Exécute `zou vtable show -t:json -0 <tag>` dans le cache, qui doit donc avoir été préparé par `sync`.
+- **`ipub(url)`** — Exécute `zou ipub -t:json -0` dans le cache, qui doit donc avoir été préparé par `sync`.
 - **`pull()`** — Sans effet (le clonage gère déjà la mise à jour).
 
 ## Licence
